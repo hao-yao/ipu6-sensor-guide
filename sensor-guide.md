@@ -4,8 +4,6 @@
 Intel IPU6 Sensor enabling guidance
 ===================================
 
----
-
 Preparation
 -----------
 
@@ -21,14 +19,12 @@ Preparation
 
 6. Intel IPU6 userspace driver source code, including libcamhal (and binary dependencies installed) and icamerasrc.
 
----
-
 Kernel Driver
 -------------
 
 ### 1. Create a camera sensor driver source code
 
-The MIPI camera sensors are mostly i2c devices so driver source code files are placed in drivers/media/i2c. To make kernel Kbuild system can find it, we need to add corresponding items in Kconfig and Makefile. Add below parts to corresponding files:
+The MIPI camera sensors are mostly i2c devices so driver source code files are placed in drivers/media/i2c. To make kernel Kbuild system to find it, we need to add corresponding items in Kconfig and Makefile. Add below parts to corresponding files:
 
 drivers/media/i2c/Kconfig:
 ```config
@@ -43,7 +39,7 @@ config VIDEO_<sensor name>
       <sensor name> camera.
 ```
 
-drivers/media/i2c/Kconfig:
+drivers/media/i2c/Makefile:
 ```makefile
 obj-$(CONFIG_VIDEO_OV13B10) += ov13b10.o
 ```
@@ -51,8 +47,6 @@ obj-$(CONFIG_VIDEO_OV13B10) += ov13b10.o
 Then when you build the kernel, you can add `CONFIG_VIDEO_<sensor name>=m` to build your driver as a module.
 
 The structure of i2c sensor driver is basically the same. We can take drivers/media/i2c/ov13b10.c as a reference.
-
----
 
 ### 2. Power on a camera sensor
 
@@ -79,7 +73,7 @@ struct ov13b10 {
 ...
 };
 
-// This function tries to get power control resources
+/* This function tries to get power control resources */
 static int ov13b10_get_pm_resources(struct device *dev)
 {
 	struct v4l2_subdev *sd = dev_get_drvdata(dev);
@@ -154,8 +148,8 @@ static int ov13b10_power_on(struct device *dev)
 	return 0;
 }
 
-// After this module is loaded, probe function is called
-// if this device HID is enumerated by ACPI table.
+/* After this module is loaded, probe function is called
+   if this device HID is enumerated by ACPI table. */
 static int ov13b10_probe(struct i2c_client *client)
 {
 ...
@@ -193,20 +187,95 @@ error_power_off:
 
 static const struct dev_pm_ops ov13b10_pm_ops = {
 ...
-// This line set power_on/off functions as runtime power management
-// callback so when pm_runtime APIs are called, the power_on/off
-// functions can actually set the power of camera sensor.
+/* This line set power_on/off functions as runtime power management
+   callback so when pm_runtime APIs are called, the power_on/off
+   functions can actually set the power of camera sensor. */
 	SET_RUNTIME_PM_OPS(ov13b10_power_off, ov13b10_power_on, NULL)
 };
 ```
 
 In another case, camera power is controlled by CVF devices and we use `vsc_acquire/release_camera_sensor()` functions to set the power. In this case, we call these APIs in power_on/off functions instead of pull GPIO pins or set clock or regulator.
 
-If the driver can be loaded and probe function can be called, we can test if camera power is on by testing the i2c read and write. Use `i2c_detect` and `i2c_transfer` in bash to detect if the device is on a specific i2c bus and read/write function is OK. If power status is not expected, we need to check the power management resources by camera sensor's specification document.
+After the driver can be loaded and probe function can be called, we can directly check the voltages of power pins by multimeter. But we can also check if sensor i2c works instead of checking voltage.
 
----
+### 3. i2c R/W function
 
-### 3. Register settings of camera sensors
+If you know nothing about i2c, please Google to know the common knowledge of i2c and the manual of `i2cdetect` and `i2ctransfer` tools.
+
+We can use `i2cdetect` in bash to detect if the device is on a specific i2c bus and use `i2ctransfer` to directly transfer i2c message on a bus. Usually we try to read the chip ID of a camera sensor to ensure the power pins are ready and i2c works. If the behavior is not expected, we need to check the power management resources by camera sensor's specification document.
+
+Before we can read/write register values in driver, we need to implement the i2c read and write function.
+
+```c
+/* Read registers up to 4 at a time */
+static int ov13b10_read_reg(struct ov13b10 *ov13b,
+			    u16 reg, u32 len, u32 *val)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&ov13b->sd);
+	struct i2c_msg msgs[2];
+	u8 *data_be_p;
+	int ret;
+	__be32 data_be = 0;
+	__be16 reg_addr_be = cpu_to_be16(reg);
+
+	if (len > 4)
+		return -EINVAL;
+
+	data_be_p = (u8 *)&data_be;
+	/* Write register address */
+	msgs[0].addr = client->addr;
+	msgs[0].flags = 0;
+	msgs[0].len = 2;
+	msgs[0].buf = (u8 *)&reg_addr_be;
+
+	/* Read data from register */
+	msgs[1].addr = client->addr;
+	msgs[1].flags = I2C_M_RD;
+	msgs[1].len = len;
+	msgs[1].buf = &data_be_p[4 - len];
+
+	ret = i2c_transfer(client->adapter, msgs, ARRAY_SIZE(msgs));
+	if (ret != ARRAY_SIZE(msgs))
+		return -EIO;
+
+	*val = be32_to_cpu(data_be);
+
+	return 0;
+}
+
+/* Write registers up to 4 at a time */
+static int ov13b10_write_reg(struct ov13b10 *ov13b,
+			     u16 reg, u32 len, u32 __val)
+{
+	struct i2c_client *client = v4l2_get_subdevdata(&ov13b->sd);
+	int buf_i, val_i;
+	u8 buf[6], *val_p;
+	__be32 val;
+
+	if (len > 4)
+		return -EINVAL;
+
+	buf[0] = reg >> 8;
+	buf[1] = reg & 0xff;
+
+	val = cpu_to_be32(__val);
+	val_p = (u8 *)&val;
+	buf_i = 2;
+	val_i = 4 - len;
+
+	while (val_i < 4)
+		buf[buf_i++] = val_p[val_i++];
+
+	if (i2c_master_send(client, buf, len + 2) != len + 2)
+		return -EIO;
+
+	return 0;
+}
+```
+
+One thing to notice is that some chips use 2-byte register address while some use 1-byte. So you need to know exactly what messages the function should send to complete those functions. For example, ov13b10 use 2-byte register address. the `u8 buf[]` stores 2 byte address in `buf[0]` and `buf[1]`, and value should start at `buf[2]`. But for 1-byte address chip, only `buf[0]` is needed to store an address and value should start at `buf[1]`. The total number of messages in calling `i2c_master_send()` should also be changed to `len + 1`.
+
+### 4. Register settings of camera sensors
 
 After camera sensor is powered on, usually we need a set of register settings to write to sensor to initialize it. We can get register settings from vendor or source code from other platforms. It can be integrated to driver like this:
 
@@ -276,14 +345,14 @@ We also need to focus on some key control register address, including:
 
 - Test pattern, which is useful in debugging.
 
----
+- Page select, which is used by some chips to select register page before actually reading or writing a register.
 
-### 4. Link camera sensor to IPU6
+### 5. Link camera sensor to IPU6
 
 A MIPI camera sensor works as a sub-device of IPU6 in V4L2 framework, so we need to bind the sensor to IPU6 as a sub-device. drivers/media/pci/intel/cio2-bridge.c implemented this function and we can set the sensor's information in it to let IPU6 takes it as its sub-device.
 
 ```c
-// cio2-bridge.h
+/* cio2-bridge.h */
 #define CIO2_SENSOR_CONFIG(_HID, _NR, ...)  \
     ((const struct cio2_sensor_config) {    \
         .hid = (_HID),          \
@@ -297,7 +366,7 @@ struct cio2_sensor_config {
     const u64 link_freqs[MAX_NUM_LINK_FREQS];
 };
 
-// cio2-bridge.c
+/* cio2-bridge.c */
 static const struct cio2_sensor_config cio2_supported_sensors[] = {
 ...
      /* Omnivision ov13b10 */
@@ -308,9 +377,7 @@ static const struct cio2_sensor_config cio2_supported_sensors[] = {
 
 Add the sensor's info to `cio2_supported_sensors` array, then when cio2-bridge find corresponding sensor it binds sensor as a sub-device.
 
----
-
-### 5. Validate the raw output with kernel driver only
+### 6. Validate the raw output with kernel driver only
 
 We can use `media-ctl` to create link between camera sensor and IPU6 ISYS then use `yavta` tool to dump raw image to validate if kernel driver function is OK. We can create the shell script according to reference below:
 
@@ -629,5 +696,4 @@ icamerasrc is a libcamhal-based gstreamer plugin for Intel IPU6 MIPI cameras. Be
 sudo -E gst-launch-1.0 icamerasrc device-name=ov13b10-wf af-mode=2 ! video/x-raw,format=NV12,width=1280,height=720 ! videoconvert ! ximagesink
 ```
 
-For more details you can check `gst-inspeck-1.0 icamerasrc`.
-
+For more details you can check `gst-inspect-1.0 icamerasrc`.
